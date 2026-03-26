@@ -3,8 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+<meta http-equiv="X-Content-Type-Options" content="nosniff">
+<meta http-equiv="X-Frame-Options" content="DENY">
+<meta http-equiv="Referrer-Policy" content="no-referrer">
 <title>Чат</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://js.hcaptcha.com/1/api.js" async defer></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -251,6 +255,15 @@ input, textarea, button { touch-action: auto !important; pointer-events: auto !i
   min-height: 12px;
   text-align: center;
   width: 100%;
+}
+
+.captcha-wrap {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  transform: scale(0.88);
+  transform-origin: center top;
+  margin: -4px 0 -8px 0;
 }
 
 #chat-screen {
@@ -714,8 +727,12 @@ input, textarea, button { touch-action: auto !important; pointer-events: auto !i
           <div class="req-item" id="req-name"><span class="req-dot"></span> Ник 2-12</div>
           <div class="req-item" id="req-pass"><span class="req-dot"></span> Пароль 4+</div>
           <div class="req-item" id="req-avatar"><span class="req-dot"></span> Аватар</div>
+          <div class="req-item" id="req-captcha"><span class="req-dot"></span> Капча</div>
         </div>
         <div class="error-text" id="reg-error"></div>
+        <div class="captcha-wrap">
+          <div id="hcaptcha-widget" class="h-captcha" data-sitekey="50b2fe65-b00b-4b9e-ad62-3ba471098be2" data-theme="dark" data-size="normal" data-callback="onCaptchaDone" data-expired-callback="onCaptchaExpired"></div>
+        </div>
         <button class="btn-join" id="btn-register" disabled>Зарегистрироваться</button>
       </div>
 
@@ -803,6 +820,18 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 const MSG_CACHE_KEY = 'chat_messages_v3';
 const MSG_CACHE_LIMIT = 200;
 
+let registerAttempts = 0;
+let registerBlockedUntil = 0;
+let lastMessageTime = 0;
+let messageCount = 0;
+let messageCountResetTime = 0;
+
+const ALLOWED_IMAGE_TYPES = ['image/jpeg','image/jpg','image/png','image/webp'];
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+const MSG_COOLDOWN_MS = 1000;
+const MSG_RATE_LIMIT = 8;
+const MSG_RATE_WINDOW = 10000;
+
 let currentUser = { username: '', avatarUrl: '' };
 let avatarFile = null;
 let chatImageFile = null;
@@ -811,6 +840,9 @@ let messages = [];
 let sending = false;
 const avatarCache = {};
 const imageUrlCache = {};
+
+let loginAttempts = 0;
+let loginBlockedUntil = 0;
 
 const $ = (s) => document.querySelector(s);
 
@@ -874,14 +906,37 @@ tabLogin.addEventListener('click', () => {
   loginError.textContent = '';
 });
 
+let captchaPassed = false;
+
+function onCaptchaDone() {
+  captchaPassed = true;
+  checkRegReady();
+}
+
+function onCaptchaExpired() {
+  captchaPassed = false;
+  checkRegReady();
+}
+
+function getCaptchaToken() {
+  try {
+    const resp = document.querySelector('[name="h-captcha-response"]');
+    return resp ? resp.value : '';
+  } catch(e) { return ''; }
+}
+
+const reqCaptcha = $('#req-captcha');
+
 function checkRegReady() {
-  const nameOk   = validUsername.test(regUsername.value);
-  const passOk   = regPassword.value.length >= 4;
-  const avatarOk = !!avatarFile;
+  const nameOk    = validUsername.test(regUsername.value);
+  const passOk    = regPassword.value.length >= 4;
+  const avatarOk  = !!avatarFile;
+  const captchaOk = captchaPassed;
   reqName.classList.toggle('met', nameOk);
   reqPass.classList.toggle('met', passOk);
   reqAvatar.classList.toggle('met', avatarOk);
-  btnRegister.disabled = !(nameOk && passOk && avatarOk);
+  reqCaptcha.classList.toggle('met', captchaOk);
+  btnRegister.disabled = !(nameOk && passOk && avatarOk && captchaOk);
 }
 
 function checkLoginReady() {
@@ -900,7 +955,8 @@ avatarPicker.addEventListener('click', () => { avatarInput.click(); });
 avatarInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  if (file.size > 2 * 1024 * 1024) { regError.textContent = 'Аватар должен быть менее 2MB'; return; }
+  if (!ALLOWED_IMAGE_TYPES.includes(file.type)) { regError.textContent = 'Разрешены только JPG, PNG, WEBP'; avatarInput.value = ''; return; }
+  if (file.size > 5 * 1024 * 1024) { regError.textContent = 'Аватар должен быть менее 5MB'; avatarInput.value = ''; return; }
   avatarFile = file;
   const reader = new FileReader();
   reader.onload = (ev) => {
@@ -913,8 +969,9 @@ avatarInput.addEventListener('change', (e) => {
   regError.textContent = '';
 });
 
-async function hashPassword(password) {
-  const data = new TextEncoder().encode(password);
+async function hashPassword(password, username) {
+  const salt = 'xchat_salt_' + username.toLowerCase() + '_2024';
+  const data = new TextEncoder().encode(salt + password + salt);
   const buf  = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
 }
@@ -923,19 +980,34 @@ btnRegister.addEventListener('click', doRegister);
 regPassword.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !btnRegister.disabled) doRegister(); });
 
 async function doRegister() {
+  const now = Date.now();
+  if (now < registerBlockedUntil) {
+    const secs = Math.ceil((registerBlockedUntil - now) / 1000);
+    regError.textContent = 'Слишком много попыток. Подождите ' + secs + ' сек.';
+    return;
+  }
+
   const username = regUsername.value.trim().toLowerCase();
   if (!validUsername.test(username)) { regError.textContent = 'Только англ. буквы и цифры, 2-12 символов'; return; }
   if (regPassword.value.length < 4)  { regError.textContent = 'Пароль минимум 4 символа'; return; }
   if (!avatarFile)                    { regError.textContent = 'Загрузите аватар'; return; }
+  if (!ALLOWED_IMAGE_TYPES.includes(avatarFile.type)) { regError.textContent = 'Недопустимый тип файла аватара'; return; }
+
+  const captchaToken = getCaptchaToken();
+  if (!captchaToken) { regError.textContent = 'Пройдите проверку капчи'; return; }
 
   btnRegister.disabled = true;
   btnRegister.textContent = 'Регистрация...';
 
   const { data: existing } = await sb.from('users').select('username').eq('username', username).maybeSingle();
   if (existing) {
+    registerAttempts++;
+    if (registerAttempts >= 5) { registerBlockedUntil = Date.now() + 60000; registerAttempts = 0; }
     regError.textContent = 'Этот ник уже занят';
-    btnRegister.disabled = false;
+    captchaPassed = false;
+    try { hcaptcha.reset(); } catch(e) {}
     btnRegister.textContent = 'Зарегистрироваться';
+    checkRegReady();
     return;
   }
 
@@ -946,20 +1018,24 @@ async function doRegister() {
   });
   if (uploadErr) {
     regError.textContent = 'Ошибка загрузки аватара';
-    btnRegister.disabled = false;
+    captchaPassed = false;
+    try { hcaptcha.reset(); } catch(e) {}
     btnRegister.textContent = 'Зарегистрироваться';
+    checkRegReady();
     return;
   }
 
   const { data: urlData }  = sb.storage.from('avatars').getPublicUrl(path);
   const avatarUrl  = urlData.publicUrl;
-  const passHash   = await hashPassword(regPassword.value);
+  const passHash   = await hashPassword(regPassword.value, username);
 
   const { error: insertErr } = await sb.from('users').insert({ username, password_hash: passHash, avatar_url: avatarUrl });
   if (insertErr) {
     regError.textContent = 'Ошибка регистрации';
-    btnRegister.disabled = false;
+    captchaPassed = false;
+    try { hcaptcha.reset(); } catch(e) {}
     btnRegister.textContent = 'Зарегистрироваться';
+    checkRegReady();
     return;
   }
 
@@ -975,14 +1051,34 @@ async function doLogin() {
   const username = loginUsername.value.trim().toLowerCase();
   if (!username || loginPassword.value.length < 4) return;
 
+  const now = Date.now();
+  if (now < loginBlockedUntil) {
+    const secs = Math.ceil((loginBlockedUntil - now) / 1000);
+    loginError.textContent = 'Слишком много попыток. Подождите ' + secs + ' сек.';
+    return;
+  }
+
   btnLogin.disabled = true;
   btnLogin.textContent = 'Вход...';
 
-  const passHash = await hashPassword(loginPassword.value);
-  const { data: user } = await sb.from('users').select('*').eq('username', username).maybeSingle();
+  const passHash = await hashPassword(loginPassword.value, username);
 
-  if (!user)                           { loginError.textContent = 'Пользователь не найден'; btnLogin.textContent = 'Войти'; checkLoginReady(); return; }
-  if (user.password_hash !== passHash)  { loginError.textContent = 'Неверный пароль';       btnLogin.textContent = 'Войти'; checkLoginReady(); return; }
+  const { data: user } = await sb.from('users').select('username, avatar_url, password_hash').eq('username', username).maybeSingle();
+
+  if (!user || user.password_hash !== passHash) {
+    loginAttempts++;
+    if (loginAttempts >= 5) {
+      loginBlockedUntil = Date.now() + 30000;
+      loginAttempts = 0;
+      loginError.textContent = 'Слишком много попыток. Подождите 30 сек.';
+    } else {
+      loginError.textContent = 'Неверный ник или пароль (' + (5 - loginAttempts) + ' попыток осталось)';
+    }
+    btnLogin.textContent = 'Войти';
+    checkLoginReady();
+    return;
+  }
+  loginAttempts = 0;
 
   currentUser = { username: user.username, avatarUrl: user.avatar_url };
   localStorage.setItem('chat_user', JSON.stringify(currentUser));
@@ -1060,6 +1156,9 @@ function subscribeRealtime() {
   sb.channel('chat-room')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
       const msg = payload.new;
+      if (!msg || !msg.username || !validUsername.test(msg.username)) return;
+      if (!msg.image_url && (!msg.content || msg.content.length > 1000)) return;
+      if (msg.image_url && msg.image_url !== '__pending__' && !msg.image_url.startsWith('https://')) return;
       const isMine = msg.username === currentUser.username;
 
       const tempIdx = messages.findIndex(m => m._temp && m.username === msg.username && (m.image_url ? !!msg.image_url : !msg.image_url));
@@ -1272,15 +1371,7 @@ function renderMessages(initial) {
   }
 }
 
-function scrollToBottom(instant) {
-  if (instant) {
-    requestAnimationFrame(() => {
-      messagesArea.scrollTop = messagesArea.scrollHeight;
-    });
-  } else {
-    smoothScrollToBottom(300);
-  }
-}
+
 
 msgInput.addEventListener('input', () => {
   updateSendBtn();
@@ -1306,7 +1397,8 @@ btnAttach.addEventListener('click', () => { imageInput.click(); });
 imageInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  if (file.size > 10 * 1024 * 1024) { alert('Изображение должно быть менее 10MB'); return; }
+  if (!ALLOWED_IMAGE_TYPES.includes(file.type)) { alert('Разрешены только изображения: JPG, PNG, WEBP'); imageInput.value = ''; return; }
+  if (file.size > MAX_IMAGE_SIZE) { alert('Изображение должно быть менее 10MB'); imageInput.value = ''; return; }
   chatImageFile = file;
   const reader = new FileReader();
   reader.onload = (ev) => {
@@ -1364,6 +1456,15 @@ async function sendMessage() {
   const content = msgInput.value.trim();
   if ((!content && !chatImageFile) || sending) return;
 
+  const now = Date.now();
+  if (now - lastMessageTime < MSG_COOLDOWN_MS) return;
+  if (now > messageCountResetTime) { messageCount = 0; messageCountResetTime = now + MSG_RATE_WINDOW; }
+  messageCount++;
+  if (messageCount > MSG_RATE_LIMIT) return;
+  lastMessageTime = now;
+
+  if (content.length > 1000) return;
+
   sending = true;
 
   const imageFile = chatImageFile;
@@ -1402,7 +1503,11 @@ async function sendMessage() {
   let image_url = null;
 
   if (imageFile) {
-    const ext = imageFile.name.split('.').pop().toLowerCase();
+    const allowedExts = ['jpg','jpeg','png','gif','webp'];
+    const ext = imageFile.name.split('.').pop().toLowerCase().replace(/[^a-z]/g,'');
+    if (!allowedExts.includes(ext) || !ALLOWED_IMAGE_TYPES.includes(imageFile.type)) {
+      sending = false; return;
+    }
     const path = currentUser.username + '_' + Date.now() + '.' + ext;
     const { error: uploadErr } = await sb.storage.from('chat-images').upload(path, imageFile, {
       cacheControl: '31536000', upsert: false
@@ -1453,9 +1558,19 @@ const saved = localStorage.getItem('chat_user');
 if (saved) {
   try {
     const u = JSON.parse(saved);
-    if (u.username && u.avatarUrl) {
+    if (u.username && u.avatarUrl && validUsername.test(u.username)) {
       currentUser = u;
       showChat();
+      sb.from('users').select('username, avatar_url').eq('username', u.username).maybeSingle().then(({ data }) => {
+        if (!data) {
+          localStorage.clear();
+          sessionStorage.clear();
+          location.reload();
+        } else {
+          currentUser.avatarUrl = data.avatar_url;
+          localStorage.setItem('chat_user', JSON.stringify(currentUser));
+        }
+      });
     }
   } catch(e) {}
 }
